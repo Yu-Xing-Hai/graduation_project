@@ -1,0 +1,3 @@
+data/
+model/qwen-7b-local
+model/scripts/hf_cache/
