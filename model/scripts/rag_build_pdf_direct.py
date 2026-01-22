@@ -1,6 +1,7 @@
 import os
 import re
 import torch
+import json
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -9,11 +10,13 @@ from langchain.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline
+from langchain_core.documents import Document
 
 # -------------------------- 1. 全局路径配置（适配你的项目结构）--------------------------
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 国内HuggingFace镜像加速
 LOCAL_MODEL_PATH = "../qwen-7b-local"  # 本地Qwen-7B模型路径
 PDF_DATA_PATH = "../../data/rag/pdf_guide/"  # PDF医疗指南存放目录
+KG_JSON_PATH = "../../data/rag/RAG-medicalKnowledgeGraph.json"  # 医疗知识图谱JSON文件路径
 CHROMA_DB_PATH = "../../data/rag/chroma_db_pdf"  # PDF专属向量库保存路径（避免覆盖旧库）
 
 # -------------------------- 2. 核心：直接批量加载PDF文件（无需转TXT）--------------------------
@@ -58,6 +61,61 @@ def batch_load_pdf():
     print(f"\nPDF加载完成汇总：共加载 {len(all_documents)} 个页面，涵盖 {pdf_count} 份PDF指南")
     return all_documents
 
+# -------------------------- 3. 新增：加载医疗知识图谱JSON--------------------------
+def load_medical_knowledge_graph():
+    """加载JSON格式的医疗知识图谱，转换为LangChain Document对象"""
+    print("\n开始加载医疗知识图谱...")
+    kg_documents = []
+
+    if not os.path.exists(KG_JSON_PATH):
+        print(f"知识图谱文件不存在：{KG_JSON_PATH}")
+        return kg_documents
+
+    # 读取JSON文件
+    with open(KG_JSON_PATH, "r", encoding="utf-8") as f:
+        kg_data = json.load(f)
+
+    # 解析每个知识图谱条目
+    for idx, item in enumerate(kg_data.get("medical_knowledge_graph", [])):
+        # 提取结构化字段
+        scene = item.get("scene", "")
+        synonyms = item.get("synonyms", [])
+        node1 = item.get("node1", "")
+        relation = item.get("relation", "")
+        node2 = item.get("node2", "")
+        evidence = item.get("evidence", "")
+
+        # 构建自然语言文本（便于向量嵌入和检索）
+        kg_text = f"""场景：{scene}
+同义词：{','.join(synonyms)}
+关系：{node1} {relation} {node2}
+证据：{evidence}"""
+
+        # 清洗文本
+        clean_kg_text = clean_text_content(kg_text)
+        if len(clean_kg_text) < 10:  # 过滤无效条目
+            continue
+
+        # 构建Document对象，保留所有结构化元数据
+        kg_doc = Document(
+            page_content=clean_kg_text,
+            metadata={
+                "source": "medical_knowledge_graph.json",
+                "source_type": "knowledge_graph",
+                "scene": scene,
+                "synonyms": ",".join(synonyms),
+                "node1": node1,
+                "relation": relation,
+                "node2": node2,
+                "evidence": evidence,
+                "kg_id": idx  # 知识图谱条目唯一标识
+            }
+        )
+        kg_documents.append(kg_doc)
+
+    print(f"知识图谱加载完成：共转换 {len(kg_documents)} 个结构化条目")
+    return kg_documents
+
 # -------------------------- 3. 文本分割（适配Qwen-7B上下文，保证连贯性）--------------------------
 def split_documents(documents):
     print("\n开始分割PDF文本片段（优化分片，提升检索精准度）...")
@@ -69,7 +127,7 @@ def split_documents(documents):
     
     # 2. 配置文本分割参数
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,  # 每个文本片段的字符数（适中，便于模型提取关键信息）
+        chunk_size=400,  # 每个文本片段的字符数（适中，便于模型提取关键信息）
         chunk_overlap=50,  # 片段间重叠字符数（避免信息断裂，提升上下文连贯性）
         length_function=len,  # 字符长度计算方式
         separators=["\n\n", "\n", "。", "！", "？", "；", "，", " "]  # 按中文标点分割，更贴合中文文本
@@ -170,47 +228,49 @@ def load_local_qwen_7b():
 
 # -------------------------- 6. 搭建RAG检索增强问答链--------------------------
 def build_rag_qa_chain(db, llm):
-    print("\n开始搭建RAG检索增强问答链...")
-    # 核心修改：无多余缩进+强制内容填充+禁止多余序号
+    print("\n开始搭建RAG检索增强问答链（融合PDF+知识图谱）...")
+    # 最终版Prompt：强制格式+禁止额外内容
     prompt_template = PromptTemplate(
-        input_variables=["question", "context"],
-        template="""你是专业风湿免疫科医生，仅基于医疗指南知识库回答问题，严格遵守：
-1. 只提取有效信息，严禁生成空序号、多余序号（仅保留2条分点），严禁复述指令/知识库；
-2. 无相关信息仅回复「未在医疗指南中查询到相关内容」，有信息则按以下格式填充具体内容：
-核心结论：一句话总结（≤50字）
-分点依据：
-1. 具体依据（标注指南名称+页码）
-2. 具体依据（标注指南名称+页码）
+    input_variables=["question", "context"],
+    template="""严格遵守以下规则回答：
+1. 仅输出【核心结论】和【分点依据】，无任何额外文字、列表、解释、问候语；
+2. 核心结论≤50字，分点依据仅写2条，每条必须标注来源；
+3. 仅使用医疗知识库中的信息，不编造未提及的指南/手册。
 
-### 医疗指南知识库
+核心结论：一句话总结
+分点依据：
+1. 具体依据（标注来源：PDF指南/知识图谱 + 证据信息）
+2. 具体依据（标注来源：PDF指南/知识图谱 + 证据信息）
+
+### 医疗知识库
 {context}
 
 ### 用户问题
 {question}
 
 ### 专业回答""",
-    )
+)
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        # 新增相似度阈值，过滤乱码/无关片段
-        retriever=db.as_retriever(search_kwargs={"k": 5}),
+        retriever=db.as_retriever(search_kwargs={"k": 4}),
         return_source_documents=True,
         chain_type_kwargs={"prompt": prompt_template}
     )
-    print("RAG检索增强问答链搭建完成")
+    print("RAG问答链搭建完成（融合PDF+知识图谱）")
     return qa_chain
 
 # -------------------------- 7. 测试RAG效果（医疗场景针对性验证）--------------------------
 def test_rag_qa(qa_chain):
     print("\n=====================================")
-    print("开始测试PDF驱动的RAG医疗知识库")
+    print("开始测试PDF+知识图谱驱动的RAG医疗知识库")
     print("=====================================\n")
 
     test_questions = [
-        "强直性脊柱炎合并炎症性肠病（IBD），使用TNFi治疗无效时，推荐使用什么药物？",
-        "ASDAS评分在强直性脊柱炎诊疗中的作用是什么？",
+        "中轴型脊柱关节炎（axSpA）包含哪些子集？",  # 知识图谱核心问题
+        "ASDAS评分在强直性脊柱炎诊疗中的作用是什么？",  # 混合PDF+知识图谱
+        "强直性脊柱炎的中医证型有哪些？",  # 知识图谱中医相关
     ]
 
     for idx, question in enumerate(test_questions, 1):
@@ -220,25 +280,45 @@ def test_rag_qa(qa_chain):
 
         result = qa_chain.invoke({"query": question})
 
+        # 修复核心：容错访问元数据，避免KeyError
         unique_source_docs = []
         seen_identifiers = set()
-        for doc in result["source_documents"]:  # 直接使用原始检索结果，不做额外过滤
-            doc_file = os.path.basename(doc.metadata["source"])
-            doc_page = doc.metadata["page"]
+        for doc in result["source_documents"]:
+            source_type = doc.metadata.get("source_type", "unknown")
+            # 分类型生成唯一标识，全部用get方法+默认值
+            if source_type == "pdf":
+                doc_file = os.path.basename(doc.metadata.get("source", "unknown.pdf"))
+                doc_page = doc.metadata.get("page", 0)
+                doc_identifier = (source_type, doc_file, doc_page)
+            else:  # 知识图谱
+                doc_source = doc.metadata.get("source", "unknown_kg.json")
+                doc_kg_id = doc.metadata.get("kg_id", -1)  # 默认值-1，避免KeyError
+                doc_identifier = (source_type, doc_source, doc_kg_id)
+            # 内容哈希去重
             doc_hash = hash(doc.page_content.strip())
-            doc_identifier = (doc_file, doc_page, doc_hash)
-            if doc_identifier not in seen_identifiers:
-                seen_identifiers.add(doc_identifier)
+            full_identifier = (doc_identifier, doc_hash)
+            
+            if full_identifier not in seen_identifiers:
+                seen_identifiers.add(full_identifier)
                 unique_source_docs.append(doc)
 
+        # 打印回答
         print(f"【专业回答】\n{result['result'].strip()}\n")
 
-        print(f"【参考指南来源】")
+        # 打印来源（区分PDF和知识图谱，同样容错）
+        print(f"【参考来源】")
         if len(unique_source_docs) > 0:
             for src_idx, source_doc in enumerate(unique_source_docs[:2]):
-                source_file = os.path.basename(source_doc.metadata["source"])
-                page_num = source_doc.metadata["page"] + 1
-                print(f"  {src_idx+1}. {source_file} 第{page_num}页")
+                source_type = source_doc.metadata.get("source_type", "unknown")
+                if source_type == "pdf":
+                    source_file = os.path.basename(source_doc.metadata.get("source", "unknown.pdf"))
+                    page_num = source_doc.metadata.get("page", 0) + 1
+                    source_info = f"{source_file} 第{page_num}页"
+                else:
+                    scene = source_doc.metadata.get("scene", "未知场景")
+                    evidence = source_doc.metadata.get("evidence", "")[:30]  # 只取前30字
+                    source_info = f"医疗知识图谱（场景：{scene}，证据：{evidence}...）"
+                print(f"  {src_idx+1}. {source_info}")
         else:
             print("  无有效参考来源")
         
@@ -247,27 +327,33 @@ def test_rag_qa(qa_chain):
 # -------------------------- 主函数：串联全流程（一键运行）--------------------------
 if __name__ == "__main__":
     try:
-        # 步骤1：直接加载PDF（无需转TXT）
+        # 步骤1：加载PDF文档
         pdf_documents = batch_load_pdf()
 
-        # 步骤2：分割文本片段
-        document_splits = split_documents(pdf_documents)
+        # 步骤2：加载知识图谱文档
+        kg_documents = load_medical_knowledge_graph()
 
-        # 步骤3：构建向量数据库
+        # 步骤3：合并所有文档（PDF+知识图谱）
+        all_documents = pdf_documents + kg_documents
+        print(f"\n合并文档完成：PDF({len(pdf_documents)}) + 知识图谱({len(kg_documents)}) = 总计{len(all_documents)}个文档")
+
+        # 步骤4：分割文本片段
+        document_splits = split_documents(all_documents)
+
+        # 步骤5：构建混合向量数据库
         chroma_db = build_vector_database(document_splits)
 
-        # 步骤4：加载本地Qwen-7B模型
+        # 步骤6：加载本地Qwen-7B模型
         qwen_llm = load_local_qwen_7b()
 
-        # 步骤5：搭建RAG问答链
+        # 步骤7：搭建RAG问答链
         rag_qa_chain = build_rag_qa_chain(chroma_db, qwen_llm)
 
-        # 步骤6：测试RAG效果
+        # 步骤8：测试RAG效果
         test_rag_qa(rag_qa_chain)
 
-        print("\n全流程运行完成！PDF驱动的RAG医疗知识库已搭建成功。")
+        print("\n全流程运行完成！PDF+知识图谱驱动的RAG医疗知识库已搭建成功。")
     except Exception as e:
-        # 优化：打印异常详情（包括行号），方便排查
         import traceback
         print(f"\n运行出错：{str(e)}")
         print(f"异常详情：\n{traceback.format_exc()}")
