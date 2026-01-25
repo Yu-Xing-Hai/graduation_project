@@ -1,3 +1,4 @@
 data/
 model/qwen-7b-local
+model/lora_checkpoints/
 model/scripts/hf_cache/
