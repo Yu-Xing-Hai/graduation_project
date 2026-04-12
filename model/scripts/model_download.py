@@ -1,20 +1,13 @@
 import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# ******** 双重镜像配置：确保国内镜像生效，延长超时时间 ********
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 国内镜像地址
-os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"  # 延长下载超时时间至5分钟，应对网络波动
-
-# 2. 模型核心配置（贴合你的目录结构，方便后续迁移权重）
-MODEL_NAME = "../qwen-7b-local"
-LOCAL_MODEL_PATH = "../qwen-7b-local"  # 后续迁移缓存权重的目标目录（对应model/qwen-7b-local）
+from config import *
 
 # 3. 加载分词器（先下载小体积分词器，快速验证环境是否正常）
 print("="*50)
 print("开始下载分词器文件...（体积较小，约几百KB，很快完成）")
 tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME,
+    BASE_MODEL_PATH,
     trust_remote_code=True,  # Qwen系列模型必需：加载阿里自定义分词逻辑和模型结构
     cache_dir="./hf_cache"  # 临时缓存目录（自动创建，无需手动新建，方便后续迁移权重）
 )
@@ -25,7 +18,7 @@ print("="*50)
 print("开始下载Qwen-7B模型权重...（约13GB，分2个文件，支持断点续传，耐心等待）")
 print("温馨提示：你的L40 GPU有45G显存，完全足够，无需担心显存溢出～")
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
+    BASE_MODEL_PATH,
     trust_remote_code=True,  # Qwen系列模型必需参数
     torch_dtype=torch.float16,  # 改回torch_dtype，适配Qwen自定义模型类
     device_map="auto",  # 自动分配模型到L40 GPU运行

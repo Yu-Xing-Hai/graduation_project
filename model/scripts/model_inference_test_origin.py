@@ -2,28 +2,13 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
-
-# ===================== 核心配置（抽离出来，方便修改） =====================
-# 基础模型路径（和训练时一致）
-BASE_MODEL_PATH = "../qwen-7b-local"
-# LoRA权重路径（训练后保存的最终权重）
-LORA_WEIGHTS_PATH = "../lora_checkpoints/qwen-lora-as-final"
-# 推理设备（固定GPU 0，和训练一致）
-DEVICE = "cuda:0"
-# 推理参数（可根据需求调整）
-INFERENCE_CONFIG = {
-    "max_new_tokens": 200,    # 适配训练数据的回答长度
-    "do_sample": False,       # 纯贪心解码（无随机性，最精准）
-    "repetition_penalty": 1.5, # 加大重复惩罚，避免循环
-    "num_beams": 1,           # 贪心解码（单beam）
-}
+from config import *
 
 # ===================== 模型加载（封装成函数，复用性强） =====================
-def load_as_model(base_model_path: str, lora_path: str) -> tuple:
+def load_as_model(base_model_path: str) -> tuple:
     """
     加载基础模型 + AS（强直性脊柱炎）LoRA权重
     :param base_model_path: 本地Qwen-7B模型路径
-    :param lora_path: 训练好的LoRA权重路径
     :return: (加载好的模型, tokenizer)
     """
     try:
@@ -46,14 +31,11 @@ def load_as_model(base_model_path: str, lora_path: str) -> tuple:
             low_cpu_mem_usage=True
         )
 
-        # 3. 融合LoRA权重到基础模型
-        lora_model = PeftModel.from_pretrained(base_model, lora_path)
-        lora_model = lora_model.to(DEVICE)
         # 推理模式（禁用梯度，提升速度、节省显存）
-        lora_model.eval()
+        base_model.eval()
 
         print(f"✅ 模型加载完成，使用设备：{DEVICE}")
-        return lora_model, tokenizer
+        return base_model, tokenizer
 
     except FileNotFoundError as e:
         raise FileNotFoundError(f"模型/权重路径错误：{e}")
@@ -130,20 +112,10 @@ def as_inference(model, tokenizer, prompt: str) -> str:
 if __name__ == "__main__":
     # 1. 加载模型
     try:
-        model, tokenizer = load_as_model(BASE_MODEL_PATH, LORA_WEIGHTS_PATH)
+        model, tokenizer = load_as_model(BASE_MODEL_PATH)
 
         # 2. 测试AS相关问题
-        # 先测试训练数据里有的问题（比如症状→风险等级），能验证模型是否正常
-        test_prompt = """### 任务背景：基于《非放射学中轴型脊柱关节炎诊疗指南（2024版）》《强直性脊柱炎诊疗规范（2024版）》《强直性脊柱炎病证结合诊疗指南（2024）》，完成强直性脊柱炎患者的风险评估与诊疗建议输出。
-### 患者症状：发病年龄40岁，中年男性，2种非甾体抗炎药（NSAIDs）治疗无效，骶髂关节CT显示双侧Ⅱ级损伤，存在骨侵蚀表现。
-### 输出要求：
-1. 风险等级：仅按“Ⅹ级（××风险）”格式明确判定（如“Ⅱ级（中等风险）”“Ⅲ级（中-高风险）”）；
-2. 判定依据：分三部分清晰阐述——
-   （1）指南规则依据：对应上述2024版指南的具体推荐意见；
-   （2）风险分级标准依据：匹配Ⅰ/Ⅱ/Ⅲ/Ⅳ级风险分级的核心判定条件（需结合症状、炎症指标、结构损伤、治疗状态等维度）；
-   （3）核心风险原因：结合患者症状，说明判定该风险等级的核心逻辑（如结构损伤、治疗应答、年龄等因素）；
-3. 诊疗建议：分“西医干预”“中医干预”“随访与生活方式”三部分给出针对性建议，需贴合临床实操且匹配指南推荐；
-4. 格式约束：禁止使用选择题形式（如A/B/C/D、①/②/③等选项式表述），所有内容采用“1./2./3.”分点或段落式呈现，语言专业、逻辑连贯，贴合临床诊疗语境。
+        test_prompt = """### 问题：强直性脊柱炎的典型症状有哪些？
 ### 回答："""
         print(f"📝 输入问题：{test_prompt.split('### 回答：')[0]}")
         
