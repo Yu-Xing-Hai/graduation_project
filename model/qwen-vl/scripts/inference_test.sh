@@ -1,0 +1,4 @@
+python model_inference_test_origin.py
+python model_inference_test_LoRA.py
+python model_inference_test_RAG.py
+python model_inference_test_LoRA_RAG.py

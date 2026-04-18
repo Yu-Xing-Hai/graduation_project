@@ -1,4 +1,7 @@
 data/
-model/qwen-7b-local
-model/lora_checkpoints/
-model/scripts/hf_cache/
+model/qwen-7b/qwen-7b-local
+model/qwen-7b/lora_checkpoints/
+model/qwen-7b/scripts/hf_cache/
+model/qwen-vl/qwen2-vl-7b-instruct
+model/qwen-vl/lora_checkpoints/
+node_modules/

@@ -1,41 +1,30 @@
 import json
 import os
-# 基础计算库
 import torch
-# PEFT（LoRA核心，Parameter-Efficient Fine-Tuning，参数高效微调）
 from peft import LoraConfig, get_peft_model
-# Transformers（加载Qwen模型/tokenizer）
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer,
     TrainingArguments, Trainer, DataCollatorForLanguageModeling
 )
-# 数据集处理
 from datasets import Dataset
 from config import *
 
-# 2. 加载Qwen的tokenizer
+# 加载Qwen的tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
     BASE_MODEL_PATH,
     trust_remote_code=True,
     padding_side="left"
 )
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.pad_token_id = tokenizer.eos_token_id
 print(f"✅ Qwen Tokenizer加载完成，词汇表大小：{len(tokenizer)}")
 
-# 3. 加载Qwen预训练模型（应用8bit量化）
+# 加载Qwen预训练模型
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_PATH,
     trust_remote_code=True,
     device_map="auto",
     torch_dtype=torch.float16
-)
-
-LORA_CONFIG = LoraConfig(
-    r=32,  # LoRA低秩矩阵的秩，秩越大，可训练参数越多，微调能力越强（常规8-64）
-    lora_alpha=64,  # LoRA缩放因子，控制权重更新幅度，通常设置为r的2倍
-    target_modules=["c_attn", "c_proj", "w1", "w2"],  # 给Qwen模型的注意力层、输出投影层、前馈层插入LoRA
-    lora_dropout=0.05,  # LoRA层的dropout率，防止训练过拟合
-    bias="none",  # 不训练偏置项，最大化减少参数量
-    task_type="CAUSAL_LM"  # 任务类型：因果语言模型（大模型文本生成专用）
 )
 
 # 将LoRA配置绑定到Qwen基础模型
@@ -59,14 +48,13 @@ try:
         if missing_fields:
             raise ValueError(f"❌ 第{idx+1}条数据（data_id={item.get('data_id','未知')}）缺失字段：{missing_fields}")
         
-        # 核心：拼接成LoRA微调的「问题+回答」text格式
-        text = f"""### 问题：{item['symptom_combination']}
-### 回答：
+        # 核心：拼接成LoRA微调的「症状+建议」text格式
+        text = f"""### 症状：{item['symptom_combination']}
+### 诊疗建议：
 风险等级：{item['risk_level']}
 判定依据：{item['guideline_rule']}
 诊疗建议：{item['suggestion']}
 """
-        
         as_qa_data.append({"text": text})  # 转为之前的text字段格式
     
     print(f"✅ 数据拼接完成，生成 {len(as_qa_data)} 条微调文本数据")
@@ -82,22 +70,24 @@ except ValueError as e:
     exit(1)
 
 dataset = Dataset.from_list(as_qa_data)
+# 随机打乱数据集，保证训练公平
+dataset = dataset.shuffle(seed=42)
 
-# 4. 定义数据预处理函数
+# 数据预处理函数，定义翻译规则（把文字转数字）
 def preprocess_function(examples):
+    # 调用分词器，处理这批数据里的 text 字段，并应用翻译规则
     return tokenizer(
-        examples["text"],
-        truncation=True,
-        max_length=1024,
-        return_overflowing_tokens=False
+        examples["text"],       # 要翻译的文字
+        truncation=True,        # 文字太长就直接剪断（不超过上限）
+        max_length=500,        # 最多保留500个数字（token）
+        return_overflowing_tokens=False  # 剪掉的部分直接扔掉，不要了
     )
 
-# 5. 批量Tokenize数据集
+# 批量Tokenize数据集，批量执行翻译（把所有数据都用翻译规则转数字）
 tokenized_dataset = dataset.map(preprocess_function, batched=True)
 print(f"✅ 数据集Tokenize完成，处理后数据量：{len(tokenized_dataset)}")
 
-# 6. 自定义DataCollator（绕过tokenizer的pad token，手动padding）
-# 6. 自定义DataCollator（数据整理器）
+# 自定义DataCollator（绕过tokenizer的pad token，手动padding）
 # 作用：针对Qwen模型无默认pad_token的问题，手动实现文本序列填充，适配大模型训练
 def custom_data_collator(features):
     """
@@ -147,10 +137,9 @@ def custom_data_collator(features):
         "labels": labels_padded
     }
 
-# 6. 配置数据整理器
+# 配置数据整理器
 data_collator = custom_data_collator
 
-# ========== 模块5：配置训练参数（适配46GB显存） ==========
 # LoRA模型训练参数配置（适配Qwen-7B单卡GPU训练）
 training_args = TrainingArguments(
     # 模型训练权重、日志的输出保存路径
@@ -158,46 +147,42 @@ training_args = TrainingArguments(
     # 模型保存策略：按训练步数保存（而非按轮次）
     save_strategy="steps",
     # 每训练100步，自动保存一次模型权重
-    save_steps=100,
+    save_steps=50,  # 小样本每50步存一次
+    logging_steps=10, # 更密集的日志打印
     # 最多保留2个最新的模型文件，避免占用过多磁盘空间
     save_total_limit=2,
     # 单张GPU每批次训练的样本数量（小批次适配显存不足的问题）
     per_device_train_batch_size=2,
     # 梯度累积步数：累积3步后更新一次参数，模拟更大的批次训练效果
     gradient_accumulation_steps=3,
-
-    # ------------------- 核心修复参数 -------------------
     # 关闭FP16混合精度训练（避免梯度缩放器报错）
     fp16=False,
     # 关闭BF16混合精度训练（适配消费级显卡，提升兼容性）
     bf16=False,
     # 关闭梯度检查点（关闭后训练速度更快，显存充足时使用）
     gradient_checkpointing=False,
-    # ----------------------------------------------------
-
     # 训练结束后，不自动加载效果最好的模型
     load_best_model_at_end=False,
     # 评估策略：不进行验证（本项目无独立验证集）
     evaluation_strategy="no",
     # 学习率：LoRA微调推荐值，控制模型参数更新幅度
     learning_rate=3e-5,
-    # 总训练轮次：全程训练6轮，保证模型充分学习专科知识
-    num_train_epochs=2,
+    # 总训练轮次：全程训练4轮，保证模型充分学习专科知识
+    num_train_epochs=4,
     # 8位量化优化器：大幅降低显存占用，单卡可运行7B大模型微调
     optim="paged_adamw_8bit",
     # 关闭分布式训练参数检查（单卡训练专用，避免报错）
     ddp_find_unused_parameters=False,
-    # 每训练20步，打印一次训练日志（损失值、进度等）
-    logging_steps=20,
     # 不向云端上报训练日志（本地训练专用）
     report_to="none",
     # 自动移除数据集中无用的列，提升训练效率
     remove_unused_columns=True,
     # 固定随机种子：保证训练结果可复现
     seed=42,
+    warmup_steps=50,    # 前50步逐步提升学习率
+    weight_decay=0.01,  # 权重衰减，防止过拟合
 )
 
-# ========== 模块6：启动训练 ==========
 # 初始化Trainer
 trainer = Trainer(
     model=model,
@@ -206,11 +191,11 @@ trainer = Trainer(
     data_collator=data_collator
 )
 
-# 3. 启动训练
+# 启动训练
 print("🚀 开始训练AS LoRA模型...")
 trainer.train()
 
-# 4. 保存最终LoRA权重
+# 保存最终LoRA权重
 model.save_pretrained(LORA_WEIGHTS_PATH)
 print(f"✅ LoRA权重已保存至：{LORA_WEIGHTS_PATH}")
 

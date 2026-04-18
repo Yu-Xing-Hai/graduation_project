@@ -1,0 +1,1 @@
+rm -rf /apps/users/icps_intelligence/data/dhc/data/rag/chroma_db_pdf

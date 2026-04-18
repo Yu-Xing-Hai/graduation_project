@@ -1,0 +1,1 @@
+rm -rf /apps/users/icps_intelligence/data/dhc/model/lora_checkpoints

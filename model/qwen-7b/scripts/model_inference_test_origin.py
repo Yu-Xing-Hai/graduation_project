@@ -1,18 +1,36 @@
+import warnings
+import logging
+import os
+
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning, message=r".*torch.utils._pytree._register_pytree_node.*")
+os.environ["PYTHONWARNINGS"] = "ignore"
+logging.basicConfig(level=logging.CRITICAL)
+logging.getLogger().disabled = True
+logging.getLogger("transformers").disabled = True
+logging.getLogger("torch").disabled = True
+logging.getLogger("huggingface_hub").disabled = True
+logging.getLogger("peft").disabled = True
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TRANSFORMERS_SUPPRESS_LOGS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["FLASH_ATTENTION_FORCE_DISABLE"] = "1"
+
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import os
 from config import *
 
-# ===================== 模型加载（封装成函数，复用性强） =====================
+# ===================== 模型加载 =====================
 def load_as_model(base_model_path: str) -> tuple:
     """
-    加载基础模型 + AS（强直性脊柱炎）LoRA权重
+    加载基础模型
     :param base_model_path: 本地Qwen-7B模型路径
     :return: (加载好的模型, tokenizer)
     """
     try:
-        # 1. 加载Tokenizer（和训练时配置一致）
+        # 1. 加载Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             base_model_path,
             trust_remote_code=True,
@@ -22,7 +40,7 @@ def load_as_model(base_model_path: str) -> tuple:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # 2. 加载基础模型（统一float16精度，和训练一致）
+        # 2. 加载基础模型（统一float16精度）
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
             trust_remote_code=True,
@@ -34,7 +52,7 @@ def load_as_model(base_model_path: str) -> tuple:
         # 推理模式（禁用梯度，提升速度、节省显存）
         base_model.eval()
 
-        print(f"✅ 模型加载完成，使用设备：{DEVICE}")
+        print(f"✅ 纯LoRA模型加载完成，使用设备：{DEVICE}")
         return base_model, tokenizer
 
     except FileNotFoundError as e:
@@ -42,7 +60,7 @@ def load_as_model(base_model_path: str) -> tuple:
     except Exception as e:
         raise RuntimeError(f"模型加载失败：{e}")
 
-# ===================== 推理函数（封装，可批量调用） =====================
+# ===================== 推理函数 =====================
 def as_inference(model, tokenizer, prompt: str) -> str:
     """
     AS（强直性脊柱炎）问题推理
@@ -52,76 +70,90 @@ def as_inference(model, tokenizer, prompt: str) -> str:
     :return: 模型生成的完整回答
     """
     try:
-        # ========== 核心修改：手动padding（复用训练时的逻辑） ==========
-        # 1. 编码时关闭自动padding，只做truncation
+        # ========== 手动padding逻辑 ==========
         inputs = tokenizer(
             prompt,
             return_tensors="pt",
-            padding=False,  # 关键：关掉自动padding
+            padding=False,
             truncation=True,
-            max_length=1024  # 和训练时的max_length一致
+            max_length=1024
         )
         
-        # 2. 提取input_ids，手动padding（和训练时用同一个pad_id）
         input_ids = inputs["input_ids"]
-        max_len = 1024  # 训练时的最大长度，保持一致
+        max_len = 1024
         pad_len = max_len - input_ids.shape[1]
         
-        # 确定pad_id（和训练时完全一样：优先eos_token_id，兜底151850）
         if tokenizer.eos_token_id is not None:
             pad_id = tokenizer.eos_token_id
         else:
-            pad_id = 151850  # 你的词汇表最后一个有效ID
+            pad_id = 151850
         
-        # 手动padding input_ids（左边padding，和训练时padding_side="left"一致）
         if pad_len > 0:
             pad_tensor = torch.tensor([[pad_id]*pad_len], dtype=torch.long)
             input_ids = torch.cat([pad_tensor, input_ids], dim=1)
         
-        # 3. 手动构造attention_mask（padding部分设为0，有效部分设为1）
         attention_mask = torch.ones_like(input_ids)
         if pad_len > 0:
             attention_mask[:, :pad_len] = 0
         
-        # 4. 重构inputs并转到指定设备
         inputs = {
             "input_ids": input_ids.to(DEVICE),
             "attention_mask": attention_mask.to(DEVICE)
         }
         # ========== 手动padding逻辑结束 ==========
 
-        # 生成回答（使用配置参数）
-        with torch.no_grad():  # 禁用梯度计算，节省显存
+        with torch.no_grad():
             outputs = model.generate(
                 **inputs,
                 eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=pad_id,  # 用手动指定的pad_id
-                **INFERENCE_CONFIG  # 传入推理参数
+                pad_token_id=pad_id,
+                **INFERENCE_CONFIG
             )
 
-        # 解码并提取回答（跳过特殊token）
         answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # 只提取“### 回答：”后的内容（更整洁）
         answer = answer.split("### 回答：")[-1].strip()
         return answer
 
     except Exception as e:
         raise RuntimeError(f"推理失败：{e}")
 
-# ===================== 测试入口（单独调用，方便调试） =====================
+# ===================== 批量测试7个问题  =====================
 if __name__ == "__main__":
-    # 1. 加载模型
+    test_questions = [
+        "我早上起来背僵，活动一会就好，是强直性脊柱炎吗？",
+        "强直性脊柱炎的典型症状有哪些？",
+        "40岁男性，骶髂关节双侧Ⅱ级损伤，风险等级是多少？",
+        "强直性脊柱炎的中医证型和干预方案是什么？",
+        "我腰疼好几个月了，怎么办？",
+        "感冒了应该吃什么药？",
+        "膝盖疼是不是AS的症状？"
+    ]
+
     try:
+        # 加载origin模型
         model, tokenizer = load_as_model(BASE_MODEL_PATH)
 
-        # 2. 测试AS相关问题
-        test_prompt = """### 问题：强直性脊柱炎的典型症状有哪些？
+        print("\n=====================================")
+        print("强直性脊柱炎智能诊疗系统 - origin版（无LoRA + RAG）")
+        print("=====================================\n")
+
+        # 遍历所有问题，批量测试
+        for idx, question in enumerate(test_questions, 1):
+            print(f"【测试问题 {idx}】{question}")
+            print("-" * 50)
+
+            # 构造LoRA训练时的标准Prompt
+            prompt = f"""### 问题：{question}
 ### 回答："""
-        print(f"📝 输入问题：{test_prompt.split('### 回答：')[0]}")
-        
-        # 3. 执行推理
-        result = as_inference(model, tokenizer, test_prompt)
-        print(f"💡 模型回答：\n{result}")
+
+            # origin模型推理
+            result = as_inference(model, tokenizer, prompt)
+            
+            # 输出格式和 RAG 版本完全一致
+            print(f"【origin model回答】\n{result}\n")
+            print("-" * 50 + "\n")
+
+        print("\n✅ origin model 批量推理测试完成！")
 
     except Exception as e:
         print(f"❌ 运行出错：{e}")

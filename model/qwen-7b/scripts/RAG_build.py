@@ -14,7 +14,7 @@ from langchain_core.documents import Document
 from peft import PeftModel
 from config import *
 
-# -------------------------- 2. 核心：直接批量加载PDF文件（无需转TXT）--------------------------
+# -------------------------- 批量加载PDF文件 --------------------------
 def batch_load_pdf():
     """
     批量加载目录下所有PDF文件，自动提取文本+保留页码/文件路径元数据
@@ -35,15 +35,14 @@ def batch_load_pdf():
             # 加载PDF所有页面，返回按页拆分的Document列表
             pdf_documents = loader.load()
 
-            # 优化：调用统一的清洗函数（替换原有重复清洗逻辑）
+            # 调用统一的清洗函数（替换原有重复清洗逻辑）
             for doc in pdf_documents:
                 doc.page_content = clean_text_content(doc.page_content)
-            
-            # 合并当前PDF的所有页面文档到总列表
+            # 过滤空内容的文档
+            pdf_documents = [d for d in pdf_documents if d.page_content]
             all_documents.extend(pdf_documents)
             print(f"成功加载：{filename}（共{len(pdf_documents)}页）")
         
-        # 优化：细化异常捕获，精准排查问题
         except FileNotFoundError:
             print(f"加载失败：{filename}，文件不存在或路径错误")
         except PermissionError:
@@ -56,7 +55,7 @@ def batch_load_pdf():
     print(f"\nPDF加载完成汇总：共加载 {len(all_documents)} 个页面，涵盖 {pdf_count} 份PDF指南")
     return all_documents
 
-# -------------------------- 3. 新增：加载医疗知识图谱JSON--------------------------
+# -------------------------- 加载医疗知识图谱JSON--------------------------
 def load_medical_knowledge_graph():
     """加载JSON格式的医疗知识图谱，转换为LangChain Document对象"""
     print("\n开始加载医疗知识图谱...")
@@ -111,46 +110,68 @@ def load_medical_knowledge_graph():
     print(f"知识图谱加载完成：共转换 {len(kg_documents)} 个结构化条目")
     return kg_documents
 
-# -------------------------- 3. 文本分割（适配Qwen-7B上下文，保证连贯性）--------------------------
+# -------------------------- 文本分割 --------------------------
 def split_documents(documents):
     print("\n开始分割PDF文本片段（优化分片，提升检索精准度）...")
-    # 1. 文本预处理：过滤过短的无效片段
+    # 文本预处理：过滤过短的无效片段
     cleaned_documents = []
     for doc in documents:
         if len(doc.page_content) > 50:
             cleaned_documents.append(doc)
     
-    # 2. 配置文本分割参数
+    # 文本分割参数（旧版）
+    # text_splitter = RecursiveCharacterTextSplitter(
+    #     chunk_size=400,  # 每个文本片段的字符数（适中，便于模型提取关键信息）
+    #     chunk_overlap=50,  # 片段间重叠字符数（避免信息断裂，提升上下文连贯性）
+    #     length_function=len,  # 字符长度计算方式
+    #     separators=["\n\n", "\n", "。", "！", "？", "；", "，", " "]  # 按中文标点分割，更贴合中文文本
+    # )
+
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,  # 每个文本片段的字符数（适中，便于模型提取关键信息）
-        chunk_overlap=50,  # 片段间重叠字符数（避免信息断裂，提升上下文连贯性）
-        length_function=len,  # 字符长度计算方式
-        separators=["\n\n", "\n", "。", "！", "？", "；", "，", " "]  # 按中文标点分割，更贴合中文文本
+        chunk_size=800,    # 扩大到800，保留完整医学知识点
+        chunk_overlap=150,  # 增加重叠，防止知识点断裂
+        separators=["\n\n", "\n", "。", "；", "，", " "]  # 简化标点，更稳定
     )
     
-    # 3. 执行文本分割
+    # 执行文本分割
     splits = text_splitter.split_documents(cleaned_documents)
     print(f"✅ 文本分割完成：共得到 {len(splits)} 个有效文本片段（已清洗乱码和冗余内容）")
     return splits
 
-# -------------------------- 新增：通用文本清洗工具函数（复用逻辑，避免冗余）--------------------------
+# -------------------------- 通用文本清洗工具函数--------------------------
+# 文本清洗工具函数（旧版）
+# def clean_text_content(raw_text):
+#     """
+#     通用文本清洗函数（统一复用，避免多处重复逻辑）
+#     保留英文字母和医疗缩写
+#     """
+#     if not raw_text:
+#         return ""
+#     # re.sub(匹配规则, 替换成什么, 处理的文本)
+#     clean_text = re.sub(r'\n+', '\n', raw_text)
+#     clean_text = re.sub(r'\s+', ' ', clean_text)
+#     clean_text = re.sub(r'[a-zA-Z0-9_]{10,}', '', clean_text)  # 删除长串乱码
+#     clean_text = re.sub(r"[^\u4e00-\u9fff\w\.\,\;\:\!\?\(\)\-\n]", " ", clean_text)
+#     clean_text = re.sub(r'\n+', ' ', clean_text)
+#     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+#     return clean_text
+
 def clean_text_content(raw_text):
     """
-    通用文本清洗函数（统一复用，避免多处重复逻辑）
-    保留英文字母和医疗缩写
+    温和清洗：保留医疗术语、标点、符号，只删乱码/冗余空格
     """
     if not raw_text:
         return ""
-    # re.sub(匹配规则, 替换成什么, 处理的文本)
-    clean_text = re.sub(r'\n+', '\n', raw_text)
-    clean_text = re.sub(r'\s+', ' ', clean_text)
-    clean_text = re.sub(r'[a-zA-Z0-9_]{10,}', '', clean_text)  # 删除长串乱码
-    clean_text = re.sub(r"[^\u4e00-\u9fff\w\.\,\;\:\!\?\(\)\-\n]", " ", clean_text)
-    clean_text = re.sub(r'\n+', ' ', clean_text)
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-    return clean_text
+    # 1. 清理PDF页码、特殊符号
+    text = re.sub(r'第\d+页|共\d+页|Page \d+|[\uf0b7\uf0fc]', '', raw_text)
+    # 2. 统一空格/空行
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    # 3. 仅删除无效特殊字符，保留医疗常用符号 - / ( ) [ ]
+    text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9\s\.\,\;\:\(\)\[\]\-\/]", " ", text)
+    return text.strip()
 
-# -------------------------- 4. 构建Chroma向量数据库（持久化存储，后续可复用）--------------------------
+# -------------------------- 构建Chroma向量数据库 --------------------------
 def build_vector_database(document_splits):
     """将分割后的文本片段转为向量并构建持久化向量库"""
     print("\n开始构建/加载向量数据库（持久化存储）...")
@@ -177,7 +198,7 @@ def build_vector_database(document_splits):
     print(f"向量数据库处理完成，已保存/加载至目录：{CHROMA_DB_PATH}")
     return db
 
-# -------------------------- 主函数：串联全流程（一键运行）--------------------------
+# -------------------------- 主函数 --------------------------
 if __name__ == "__main__":
     try:
         # 步骤1：加载PDF文档
