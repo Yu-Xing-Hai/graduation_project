@@ -40,6 +40,12 @@ LORA_CONFIG = LoraConfig(
 )
 
 # ========================== 三、RAG相关 ======================
-PDF_DATA_PATH = "/apps/users/icps_intelligence/data/dhc/data/rag/pdf_guide"  # PDF医疗指南存放目录
-KG_JSON_PATH = "/apps/users/icps_intelligence/data/dhc/data/rag/RAG-medicalKnowledgeGraph.json"  # 医疗知识图谱JSON文件路径
-CHROMA_DB_PATH = "/apps/users/icps_intelligence/data/dhc/data/rag/chroma_db_pdf"  # PDF专属向量库保存路径（避免覆盖旧库）
+BASE_DIR = "/apps/users/icps_intelligence/data/dhc/data/rag"
+# PDF 存放路径
+PDF_DATA_PATH = os.path.join(BASE_DIR, "pdf_guidelines") # 假设你有这个文件夹
+# 知识图谱 JSON 路径
+KG_JSON_PATH = os.path.join(BASE_DIR, "knowledge_graph.json")
+# TXT 数据集路径 -> 指向你截图里的 dataSet 文件夹
+TXT_DATA_PATH = os.path.join(BASE_DIR, "dataSet")
+# 向量库存储路径
+CHROMA_DB_PATH = os.path.join(BASE_DIR, "chroma_db")

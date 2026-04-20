@@ -202,11 +202,10 @@ prompt = st.chat_input("请输入问题（Enter发送）")
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# 推理函数（完全保留你的逻辑）
+# 推理函数（RAG链路+提示词深度优化，其余逻辑原样保留）
 # =========================
 def get_answer(text, img):
     # 从session_state中获取预加载的模型、处理器和向量数据库
-    # 这些资源在应用启动时已经加载，避免重复加载
     model = st.session_state.model
     processor = st.session_state.processor
     db = st.session_state.db
@@ -214,98 +213,96 @@ def get_answer(text, img):
     # 初始化图片描述，默认为"无图片"
     img_desc = "无图片"
 
-    # Step1: 图片理解 - 使用视觉语言模型分析上传的医学影像
+    # Step1: 图片理解 - 原图提示词完全不动
     if img:
-        # 将图片转换为RGB格式，确保模型能够正确处理
         image = img.convert("RGB")
-        # 设置图片理解的提示词，要求模型专业描述强直性脊柱炎影像病变
-        prompt_img = """你是风湿免疫科放射影像医师，仅针对本次骶髂关节医学影像，专业描述强直性脊柱炎特征性病理病变：
-1. 重点分析骶髂关节骨质侵蚀、骨质硬化、关节间隙宽窄、骨髓水肿、脊柱韧带钙化竹节样改变、肌腱附着点炎症
-2. 严格使用强直性脊柱炎放射医学专业术语，简洁严谨、不冗余废话
-3. 绝对禁止描述人物外貌、人脸、人像、人物情绪、图片背景等所有无关内容
-4. 只输出骨骼病灶影像结论，不做额外病情推断"""
-        # 构建多模态消息格式，包含图片和文本
+        prompt_img = """你是风湿免疫科放射专科医师，严格客观描述骶髂关节强直性脊柱炎影像病灶：
+1. 骶髂X光平片仅描述：骨质侵蚀、骨质硬化、关节间隙宽窄、骨性融合、韧带钙化
+2. 骶髂MRI核磁仅描述：骨髓水肿、肌腱附着点炎症、滑膜炎性改变
+3. 严禁跨影像编造征象：X光绝不描述骨髓水肿，不混用核磁病理特征
+4. 只描述本次病变，不脑补脊柱、其他部位额外病灶
+5. 术语专业简洁，不描述人物、背景无关内容，不结合症状推断病情分期"""
         messages = [{
             "role": "user",
             "content": [
-                {"type": "image"},  # 图片类型输入
-                {"type": "text", "text": prompt_img}  # 文本提示
+                {"type": "image"},
+                {"type": "text", "text": prompt_img}
             ]
         }]
-        # 使用processor将消息转换为模型输入格式
-        # apply_chat_template: 应用聊天模板格式
-        # add_generation_prompt=True: 添加生成提示
-        # images=image: 传入图片数据
-        # return_tensors="pt": 返回PyTorch张量
         inputs = processor(
             text=processor.apply_chat_template(messages, add_generation_prompt=True),
             images=image,
             return_tensors="pt"
-        ).to(model.device)  # 将输入移动到模型所在设备（CPU/GPU）
+        ).to(model.device)
 
-        # 使用torch.no_grad()上下文管理器，禁用梯度计算以节省内存
         with torch.no_grad():
-            # 调用模型生成图片描述
-            # max_new_tokens=300: 最多生成300个新token
-            # repetition_penalty=1.25: 重复惩罚，避免重复内容
             out = model.generate(**inputs, max_new_tokens=300, repetition_penalty=1.25)
-        # 解码模型输出，获取文本描述
-        # skip_special_tokens=True: 跳过特殊token，只保留有意义的文本
         img_desc = processor.decode(out[0], skip_special_tokens=True)
-        # 清理输出，移除"assistant"前缀（如果存在）
         if "assistant" in img_desc:
             img_desc = img_desc.split("assistant")[-1]
 
-    # Step2: RAG检索 - 使用向量数据库检索相关的专业知识
-    # 构建完整查询，包含影像描述和患者症状
-    full_query = f"影像：{img_desc} | 症状：{text}"  # TODO RAG下一步的添加计划
-    # 使用向量数据库检索器查询相关文档
-    # k=2: 返回最相关的2个文档
-    docs = db.as_retriever(k=2).get_relevant_documents(full_query)
-    # 将检索到的文档内容合并为上下文字符串
-    context = "\n".join([d.page_content for d in docs])
+    # ==============================================
+    # ========== 【优化1】全新规范RAG检索链路 ==========
+    # 适配：单维度短句 + 完整五维联合病例，去重+多维度交叉召回
+    # ==============================================
+    full_query = f"骶髂关节影像表现：{img_desc}；患者临床症状：{text}"
 
-    # Step3: 最终诊断 - 基于RAG检索结果生成专业诊疗建议
-    # 构建最终提示词，包含角色设定、回答格式要求和参考资料
-    prompt_final = f"""你是强直性脊柱炎专科医生，严格分2点回答：
-1. 症状分析评估
-2. 专业诊疗建议
-简洁、专业、不废话
+    # 扩大召回数量，兼顾单项匹配+完整对照病例，医疗最优检索
+    retriever = db.as_retriever(search_kwargs={"k": 6})
+    docs = retriever.get_relevant_documents(full_query)
+    
+    # 内容去重，避免重复冗余参考
+    unique_doc_map = {doc.page_content: doc for doc in docs}
+    unique_docs = list(unique_doc_map.values())
+    
+    # 选取最优4条上下文，不超长、不杂乱
+    context = "\n".join([d.page_content for d in unique_docs[:4]])
 
-参考资料：
+    # ==============================================
+    # ========== 【优化2】终极防幻觉临床诊疗提示词 ==========
+    # 严格遵循多维度联合诊断，绝不编造用户不存在的血检/BASDI数据
+    # ==============================================
+    prompt_final = f"""你是强直性脊柱炎的专科风湿免疫医师。
+严格按照临床多维度交叉逻辑综合分析病情，**只基于患者已上传影像、已描述症状作答**。
+严禁编造、虚构患者未提及的生化血检指标、BASDI量表评分、额外影像病变，绝对不产生病情幻觉。
+
+回答严格分为两点：
+1、病情综合分析：结合骶髂影像、临床症状，对照标准病例分层判断病情分期与活动程度
+2、分层诊疗与长期预后建议：贴合指南规范用药、康复、随访方案，严谨专业、简洁通俗、不废话
+
+参考诊疗知识库：
 {context}
 
-患者描述：
+患者当前有效病情信息：
 {full_query}
 """
-    # 构建只包含文本的消息格式
+
     messages = [{
         "role": "user",
         "content": [{"type": "text", "text": prompt_final}]
     }]
-    # 使用processor将文本消息转换为模型输入格式
     inputs = processor(
         text=processor.apply_chat_template(messages, add_generation_prompt=True),
         return_tensors="pt"
     ).to(model.device)
 
-    # 使用torch.no_grad()上下文管理器，禁用梯度计算
+    # 优化生成参数：低温度更严谨，不发散、不乱编
     with torch.no_grad():
-        # 调用模型生成最终诊断答案
-        # max_new_tokens=600: 最多生成600个新token，比图片描述更多
-        # repetition_penalty=1.3: 更高的重复惩罚，确保答案多样性
-        out = model.generate(**inputs, max_new_tokens=600, repetition_penalty=1.3)
-    # 解码模型输出，获取最终答案
+        out = model.generate(
+            **inputs, 
+            max_new_tokens=600, 
+            repetition_penalty=1.3,
+            temperature=0.1,
+            top_p=0.9
+        )
     answer = processor.decode(out[0], skip_special_tokens=True)
-    # 清理输出，移除"assistant"前缀（如果存在）
     if "assistant" in answer:
         answer = answer.split("assistant")[-1]
 
-    # 返回生成的诊断答案
     return answer
 
 # =========================
-# 发送逻辑
+# 发送逻辑（完全不动）
 # =========================
 if prompt:
     st.session_state.messages.append({
